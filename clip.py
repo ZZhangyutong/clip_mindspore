@@ -437,3 +437,164 @@ class CLIPAttention(nn.Cell):
         attn_output = self.out_proj(attn_output)
 
         return attn_output, attn_weights_reshaped
+    
+
+class ClassInstantier(OrderedDict):
+    def __getitem__(self, key):
+        content = super().__getitem__(key)
+        cls, kwargs = content if isinstance(content, tuple) else (content, {})
+        return cls(**kwargs)
+
+class QuickGELUActivation(nn.Cell):
+    """
+    Applies GELU approximation that is fast but somewhat inaccurate. See: https://github.com/hendrycks/GELUs
+    """
+
+    def forward(self, input: Tensor) -> Tensor:
+        return input * torch.sigmoid(1.702 * input)
+    
+class CLIPMLP(nn.Cell):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.activation_fn = QuickGELUActivation()
+        self.fc1 = nn.Dense(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Dense(config.intermediate_size, config.hidden_size)
+
+    def forward(self, hidden_states: Tensor) -> Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        return hidden_states
+
+class CLIPMLP(nn.Cell):
+    def __init__(self, config):
+        super().__init__()
+        self.config = config
+        self.activation_fn = ACT2FN[config.hidden_act]
+        self.fc1 = nn.Linear(config.hidden_size, config.intermediate_size)
+        self.fc2 = nn.Linear(config.intermediate_size, config.hidden_size)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        hidden_states = self.fc1(hidden_states)
+        hidden_states = self.activation_fn(hidden_states)
+        hidden_states = self.fc2(hidden_states)
+        return hidden_states
+
+
+class CLIPEncoderLayer(nn.Cell):
+    def __init__(self, config: CLIPConfig):
+        super().__init__()
+        self.embed_dim = config.hidden_size
+        self.self_attn = CLIPAttention(config)
+        self.layer_norm1 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+        self.mlp = CLIPMLP(config)
+        self.layer_norm2 = nn.LayerNorm(self.embed_dim, eps=config.layer_norm_eps)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        attention_mask: Tensor,
+        causal_attention_mask: Tensor,
+        output_attentions: Optional[bool] = False,
+    ) -> Tuple[Tensor]:
+        """
+        Args:
+            hidden_states (`torch.FloatTensor`): input to the layer of shape `(batch, seq_len, embed_dim)`
+            attention_mask (`torch.FloatTensor`): attention mask of size
+                `(batch, 1, tgt_len, src_len)` where padding elements are indicated by very large negative values.
+                `(config.encoder_attention_heads,)`.
+            output_attentions (`bool`, *optional*):
+                Whether or not to return the attentions tensors of all attention layers. See `attentions` under
+                returned tensors for more detail.
+        """
+        residual = hidden_states
+
+        hidden_states = self.layer_norm1(hidden_states)
+        hidden_states, attn_weights = self.self_attn(
+            hidden_states=hidden_states,
+            attention_mask=attention_mask,
+            causal_attention_mask=causal_attention_mask,
+            output_attentions=output_attentions,
+        )
+        hidden_states = residual + hidden_states
+
+        residual = hidden_states
+        hidden_states = self.layer_norm2(hidden_states)
+        hidden_states = self.mlp(hidden_states)
+        hidden_states = residual + hidden_states
+
+        outputs = (hidden_states,)
+
+        if output_attentions:
+            outputs += (attn_weights,)
+
+        return outputs
+
+class CLIPPreTrainedModel(PreTrainedModel):
+    """
+    An abstract class to handle weights initialization and a simple interface for downloading and loading pretrained
+    models.
+    """
+
+    config_class = CLIPConfig
+    base_model_prefix = "clip"
+    supports_gradient_checkpointing = True
+    _keys_to_ignore_on_load_missing = [r"position_ids"]
+
+    def _init_weights(self, module):
+        """Initialize the weights"""
+        factor = self.config.initializer_factor
+        if isinstance(module, CLIPTextEmbeddings):
+            module.token_embedding.weight.data.normal_(mean=0.0, std=factor * 0.02)
+            module.position_embedding.weight.data.normal_(mean=0.0, std=factor * 0.02)
+        elif isinstance(module, CLIPVisionEmbeddings):
+            factor = self.config.initializer_factor
+            nn.init.normal_(module.class_embedding, mean=0.0, std=module.embed_dim**-0.5 * factor)
+            nn.init.normal_(module.patch_embedding.weight, std=module.config.initializer_range * factor)
+            nn.init.normal_(module.position_embedding.weight, std=module.config.initializer_range * factor)
+        elif isinstance(module, CLIPAttention):
+            factor = self.config.initializer_factor
+            in_proj_std = (module.embed_dim**-0.5) * ((2 * module.config.num_hidden_layers) ** -0.5) * factor
+            out_proj_std = (module.embed_dim**-0.5) * factor
+            nn.init.normal_(module.q_proj.weight, std=in_proj_std)
+            nn.init.normal_(module.k_proj.weight, std=in_proj_std)
+            nn.init.normal_(module.v_proj.weight, std=in_proj_std)
+            nn.init.normal_(module.out_proj.weight, std=out_proj_std)
+        elif isinstance(module, CLIPMLP):
+            factor = self.config.initializer_factor
+            in_proj_std = (
+                (module.config.hidden_size**-0.5) * ((2 * module.config.num_hidden_layers) ** -0.5) * factor
+            )
+            fc_std = (2 * module.config.hidden_size) ** -0.5 * factor
+            nn.init.normal_(module.fc1.weight, std=fc_std)
+            nn.init.normal_(module.fc2.weight, std=in_proj_std)
+        elif isinstance(module, CLIPModel):
+            nn.init.normal_(
+                module.text_projection.weight,
+                std=module.text_embed_dim**-0.5 * self.config.initializer_factor,
+            )
+            nn.init.normal_(
+                module.visual_projection.weight,
+                std=module.vision_embed_dim**-0.5 * self.config.initializer_factor,
+            )
+        elif isinstance(module, CLIPVisionModelWithProjection):
+            nn.init.normal_(
+                module.visual_projection.weight,
+                std=self.config.hidden_size**-0.5 * self.config.initializer_factor,
+            )
+        elif isinstance(module, CLIPTextModelWithProjection):
+            nn.init.normal_(
+                module.text_projection.weight,
+                std=self.config.hidden_size**-0.5 * self.config.initializer_factor,
+            )
+
+        if isinstance(module, nn.LayerNorm):
+            module.bias.data.zero_()
+            module.weight.data.fill_(1.0)
+        if isinstance(module, nn.Linear) and module.bias is not None:
+            module.bias.data.zero_()
+
+    def _set_gradient_checkpointing(self, module, value=False):
+        if isinstance(module, CLIPEncoder):
+            module.gradient_checkpointing = value
